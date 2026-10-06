@@ -144,6 +144,7 @@ get_module_function() {
     local module_name="$1"
     case "$module_name" in
         directory)    echo "module_directory" ;;
+        cache)        echo "module_cache" ;;
         context)      echo "module_context" ;;
         git)          echo "module_git" ;;
         project)      echo "module_project" ;;
@@ -200,6 +201,9 @@ run_module() {
             ;;
         context|model|cost)
             "$func_name" "$input_json"
+            ;;
+        cache)
+            "$func_name" "" "$input_json"
             ;;
         git|project)
             "$func_name" "$current_dir"
