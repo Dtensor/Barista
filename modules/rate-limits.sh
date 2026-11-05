@@ -31,6 +31,23 @@ _get_claude_usage() {
     fi
 }
 
+# Preferred source: Claude Code passes .rate_limits in the statusline stdin JSON
+# ({five_hour|seven_day: {used_percentage, resets_at(epoch s)}}). Normalise it to
+# the /api/oauth/usage shape so the rest of the module is source-agnostic.
+_usage_from_stdin() {
+    local input="$1"
+    [ -n "$input" ] || return 0
+    echo "$input" | jq -c '
+        def win(w): if w == null or w.used_percentage == null then null else
+            {utilization: w.used_percentage,
+             resets_at: (if (w.resets_at|type) == "number"
+                         then (w.resets_at|floor|strftime("%Y-%m-%dT%H:%M:%S"))
+                         else w.resets_at end)} end;
+        {five_hour: win(.rate_limits.five_hour?),
+         seven_day: win(.rate_limits.seven_day?)}
+        | if .five_hour == null and .seven_day == null then empty else . end' 2>/dev/null
+}
+
 # Get projection status indicator
 _get_projection_status() {
     local projected=$1
@@ -64,15 +81,27 @@ module_rate_limits() {
     local usage_data=""
     local fresh_fetch=false
 
-    # Read from cache if fresh
+    local cache_age=999999
     if [ -f "$cache_file" ]; then
-        local cache_age=$(($(date +%s) - $(stat -f %m "$cache_file" 2>/dev/null || echo 0)))
-        if [ "$cache_age" -lt "${CACHE_MAX_AGE:-60}" ]; then
-            usage_data=$(cat "$cache_file")
-        fi
+        cache_age=$(($(date +%s) - $(stat -f %m "$cache_file" 2>/dev/null || echo 0)))
     fi
 
-    # Fetch fresh data if needed
+    # 1) Live data from Claude Code's statusline stdin (no network, no keychain)
+    local stdin_data
+    stdin_data=$(_usage_from_stdin "$1")
+    if [ -n "$stdin_data" ]; then
+        usage_data="$stdin_data"
+        # Throttle cache/history writes so the 24h projection history isn't flooded
+        if [ "$cache_age" -ge "${CACHE_MAX_AGE:-60}" ]; then
+            echo "$stdin_data" | jq -c '. + {_src: "stdin"}' > "$cache_file" 2>/dev/null
+            fresh_fetch=true
+        fi
+    # 2) Fallback: cached API response
+    elif [ "$cache_age" -lt "${CACHE_MAX_AGE:-60}" ]; then
+        usage_data=$(cat "$cache_file")
+    fi
+
+    # 3) Fallback: fetch from the OAuth usage API
     if [ -z "$usage_data" ]; then
         usage_data=$(_get_claude_usage)
         if [ -n "$usage_data" ]; then
@@ -92,13 +121,20 @@ module_rate_limits() {
     local five_hour_obj=$(echo "$usage_data" | jq -r '.five_hour // .five_hour_opus // .five_hour_sonnet // "null"' 2>/dev/null)
     local seven_day_obj=$(echo "$usage_data" | jq -r '.seven_day // .seven_day_opus // .seven_day_sonnet // "null"' 2>/dev/null)
 
-    if [ "$five_hour_obj" = "null" ] || [ "$seven_day_obj" = "null" ]; then
+    # Each window is independent: a null 5h window (no active window yet) must not
+    # blank out a valid 7d reading. Missing windows render as "--" individually.
+    local have_5h=true have_7d=true
+    [ -z "$five_hour_obj" ] || [ "$five_hour_obj" = "null" ] && have_5h=false
+    [ -z "$seven_day_obj" ] || [ "$seven_day_obj" = "null" ] && have_7d=false
+    if [ "$have_5h" = "false" ] && [ "$have_7d" = "false" ]; then
         local result=""
         [ "$show_5h" = "true" ] && result="${label_5h}:--"
         [ "$show_7d" = "true" ] && result="${result:+$result }${label_7d}:--"
         echo "$result"
         return
     fi
+    [ "$have_5h" = "false" ] && five_hour_obj='{}'
+    [ "$have_7d" = "false" ] && seven_day_obj='{}'
 
     local five_hour=$(echo "$five_hour_obj" | jq -r '.utilization // 0' 2>/dev/null)
     local seven_day=$(echo "$seven_day_obj" | jq -r '.utilization // 0' 2>/dev/null)
@@ -219,14 +255,18 @@ module_rate_limits() {
     # Build output
     local result=""
 
-    if [ "$show_5h" = "true" ]; then
+    if [ "$show_5h" = "true" ] && [ "$have_5h" = "false" ]; then
+        result="${label_5h}:--"
+    elif [ "$show_5h" = "true" ]; then
         result="${label_5h}:${five_hour_int}% ${five_hour_usage_ind}${five_hour_status}"
         if [ "$show_time" = "true" ] && [ "$five_hour_remaining" -gt 0 ] 2>/dev/null && ! is_compact "$compact"; then
             result="${result} ($(format_time_remaining $five_hour_remaining))"
         fi
     fi
 
-    if [ "$show_7d" = "true" ]; then
+    if [ "$show_7d" = "true" ] && [ "$have_7d" = "false" ]; then
+        result="${result:+$result }${label_7d}:--"
+    elif [ "$show_7d" = "true" ]; then
         local seven_day_part="${label_7d}:${seven_day_int}% ${seven_day_usage_ind}${seven_day_status}"
         if [ "$show_time" = "true" ] && [ "$seven_day_remaining" -gt 0 ] 2>/dev/null && ! is_compact "$compact"; then
             seven_day_part="${seven_day_part} ($(format_time_remaining $seven_day_remaining))"
